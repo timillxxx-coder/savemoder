@@ -24,7 +24,9 @@ from pathlib import Path
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
+from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramNetworkError
 from aiogram.filters import CommandStart
 from aiogram.types import (
     BusinessConnection,
@@ -85,6 +87,8 @@ def init_db() -> sqlite3.Connection:
         c.execute("ALTER TABLE messages ADD COLUMN media_file_id TEXT")
     if "media_local_path" not in cols:
         c.execute("ALTER TABLE messages ADD COLUMN media_local_path TEXT")
+    if "is_self_destruct" not in cols:
+        c.execute("ALTER TABLE messages ADD COLUMN is_self_destruct INTEGER DEFAULT 0")
     c.commit()
     return c
 
@@ -132,6 +136,39 @@ def extract_media(message: Message) -> tuple[str | None, str | None]:
     return None, None
 
 
+def is_self_destructing(message: Message | None) -> bool:
+    """Эвристика: похоже ли это сообщение на исчезающее (view-once / TTL).
+
+    Bot API не отдаёт прямого флага, поэтому опираемся на косвенные признаки,
+    характерные для view-once медиа в Business-чатах:
+      • has_protected_content — view-once нельзя пересылать;
+      • photo приходит ровно с одной PhotoSize вместо обычных нескольких;
+      • video / video_note / voice без thumbnail и file_size часто означают
+        одноразовое медиа (Telegram не отдаёт превью для исчезающих).
+    """
+    if message is None:
+        return False
+    media_type, _ = extract_media(message)
+    if media_type is None:
+        return False
+    if message.has_protected_content:
+        return True
+    if media_type == "photo" and message.photo and len(message.photo) == 1:
+        return True
+    if media_type == "video" and message.video is not None:
+        v = message.video
+        if v.thumbnail is None and v.file_size is None:
+            return True
+    if media_type == "video_note" and message.video_note is not None:
+        vn = message.video_note
+        if vn.thumbnail is None:
+            return True
+    if media_type == "voice" and message.voice is not None:
+        if message.voice.file_size is None:
+            return True
+    return False
+
+
 async def send_saved_media(
     bot: Bot,
     chat_id: int,
@@ -139,37 +176,49 @@ async def send_saved_media(
     file_id: str | None,
     caption: str,
     local_path: str | None = None,
+    is_self_destruct: bool = False,
 ) -> None:
     if local_path and Path(local_path).exists():
         media: FSInputFile | str = FSInputFile(local_path)
-    elif file_id:
+    elif file_id and not is_self_destruct:
+        # У исчезающих сообщений file_id неприменим к send_* (Telegram вернёт
+        # "can't use file of type SelfDestructingPhoto as Photo" или
+        # FILE_REFERENCE_EXPIRED). Используем file_id только для обычных медиа.
         media = file_id
     else:
-        await bot.send_message(chat_id, caption + "\n\n⚠️ Медиа недоступно.")
+        await bot.send_message(chat_id, caption + "\n\n⚠️ Медиа недоступно (исходный файл уже удалён).")
         return
 
-    if media_type == "photo":
-        await bot.send_photo(chat_id, media, caption=caption)
-    elif media_type == "video":
-        await bot.send_video(chat_id, media, caption=caption)
-    elif media_type == "animation":
-        await bot.send_animation(chat_id, media, caption=caption)
-    elif media_type == "document":
-        await bot.send_document(chat_id, media, caption=caption)
-    elif media_type == "audio":
-        await bot.send_audio(chat_id, media, caption=caption)
-    elif media_type == "voice":
-        await bot.send_voice(chat_id, media, caption=caption)
-    elif media_type == "video_note":
-        if caption:
+    async def _send() -> None:
+        if media_type == "photo":
+            await bot.send_photo(chat_id, media, caption=caption)
+        elif media_type == "video":
+            await bot.send_video(chat_id, media, caption=caption, request_timeout=300)
+        elif media_type == "animation":
+            await bot.send_animation(chat_id, media, caption=caption, request_timeout=300)
+        elif media_type == "document":
+            await bot.send_document(chat_id, media, caption=caption, request_timeout=300)
+        elif media_type == "audio":
+            await bot.send_audio(chat_id, media, caption=caption, request_timeout=300)
+        elif media_type == "voice":
+            await bot.send_voice(chat_id, media, caption=caption, request_timeout=300)
+        elif media_type == "video_note":
+            if caption:
+                await bot.send_message(chat_id, caption)
+            await bot.send_video_note(chat_id, media, request_timeout=300)
+        elif media_type == "sticker":
+            if caption:
+                await bot.send_message(chat_id, caption)
+            await bot.send_sticker(chat_id, media)
+        else:
             await bot.send_message(chat_id, caption)
-        await bot.send_video_note(chat_id, media)
-    elif media_type == "sticker":
-        if caption:
-            await bot.send_message(chat_id, caption)
-        await bot.send_sticker(chat_id, media)
-    else:
-        await bot.send_message(chat_id, caption)
+
+    try:
+        await _send()
+    except TelegramNetworkError as e:
+        # Один повтор на случай таймаута выгрузки крупного видео.
+        log.warning("send media network error, retrying once: %s", e)
+        await _send()
 
 
 async def cache_media_file(
@@ -178,12 +227,13 @@ async def cache_media_file(
     message_id: int,
     media_type: str,
     file_id: str,
-) -> None:
+) -> str | None:
     """Скачивает медиа-файл сразу при получении и сохраняет путь в БД.
 
     Это нужно потому, что у исчезающих фото/видео file_id одноразовый —
     Telegram не даст переотправить его позже. Поэтому файл нужно скачать
-    немедленно, пока он ещё доступен.
+    немедленно, пока он ещё доступен. Возвращает локальный путь или None
+    при ошибке.
     """
     try:
         ext = EXT_BY_TYPE.get(media_type, ".bin")
@@ -199,11 +249,13 @@ async def cache_media_file(
             media_type, chat_id, message_id, local_path,
             local_path.stat().st_size if local_path.exists() else -1,
         )
+        return str(local_path)
     except Exception as e:
         log.warning(
             "cache_media_file failed for %s %s/%s: %s",
             media_type, chat_id, message_id, e,
         )
+        return None
 
 
 def owner_chat_for(connection_id: str | None) -> int | None:
@@ -230,7 +282,14 @@ async def main() -> None:
     if not BOT_TOKEN:
         raise SystemExit("Установите переменную окружения BOT_TOKEN")
 
-    bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    # Дольший общий таймаут — без него крупные видео при пересылке падают
+    # с "HTTP Client says - Request timeout error".
+    session = AiohttpSession(timeout=300)
+    bot = Bot(
+        BOT_TOKEN,
+        session=session,
+        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+    )
     dp = Dispatcher()
 
     # /start — обычный апдейт type=message в личке с ботом.
@@ -268,18 +327,20 @@ async def main() -> None:
     async def on_business_message(message: Message) -> None:
         text = extract_text(message)
         media_type, media_file_id = extract_media(message)
+        is_sd = is_self_destructing(message)
         log.info(
-            "business_message chat=%s msg=%s from=%s media=%s reply_to=%s",
+            "business_message chat=%s msg=%s from=%s media=%s sd=%s reply_to=%s",
             message.chat.id,
             message.message_id,
             message.from_user.id if message.from_user else None,
             media_type,
+            is_sd,
             message.reply_to_message.message_id if message.reply_to_message else None,
         )
         db.execute(
             "INSERT OR REPLACE INTO messages "
-            "(chat_id, message_id, connection_id, user_id, user_name, chat_title, text, media_type, media_file_id, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "(chat_id, message_id, connection_id, user_id, user_name, chat_title, text, media_type, media_file_id, is_self_destruct, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 message.chat.id,
                 message.message_id,
@@ -290,18 +351,26 @@ async def main() -> None:
                 text,
                 media_type,
                 media_file_id,
+                int(is_sd),
                 datetime.now(timezone.utc).isoformat(),
             ),
         )
         db.commit()
 
         # Скачиваем медиа сразу — file_id у исчезающих сообщений одноразовый.
+        # Для исчезающих ждём синхронно: иначе file_id может протухнуть до того,
+        # как пользователь ответит на сообщение.
         if media_type and media_file_id:
-            asyncio.create_task(
-                cache_media_file(
+            if is_sd:
+                await cache_media_file(
                     bot, message.chat.id, message.message_id, media_type, media_file_id
                 )
-            )
+            else:
+                asyncio.create_task(
+                    cache_media_file(
+                        bot, message.chat.id, message.message_id, media_type, media_file_id
+                    )
+                )
 
         # Если владелец ответил на медиа-сообщение собеседника — переслать его
         # в ЛС с ботом без ограничений на просмотр (для исчезающих фото/видео/кружков).
@@ -326,7 +395,7 @@ async def main() -> None:
         # получили этим же апдейтом или она не была сохранена) — попробуем взять
         # медиа прямо из reply_to_message.
         replied = db.execute(
-            "SELECT user_id, user_name, text, media_type, media_file_id, media_local_path FROM messages "
+            "SELECT user_id, user_name, text, media_type, media_file_id, media_local_path, is_self_destruct FROM messages "
             "WHERE chat_id = ? AND message_id = ?",
             (message.chat.id, replied_id),
         ).fetchone()
@@ -337,6 +406,7 @@ async def main() -> None:
         replied_media_type = replied[3] if replied else None
         replied_media_file_id = replied[4] if replied else None
         replied_local_path = replied[5] if replied else None
+        replied_is_sd = bool(replied[6]) if replied else False
 
         if not replied_media_type or not replied_media_file_id:
             r_type, r_fid = extract_media(message.reply_to_message)
@@ -358,14 +428,19 @@ async def main() -> None:
                         )
                         or "?"
                     )
+        # Если флаг исчезаемости не сохранён в БД (старая запись/пропущенная
+        # запись), попробуем определить его по reply_to_message «вживую».
+        if not replied_is_sd:
+            replied_is_sd = is_self_destructing(message.reply_to_message)
 
         log.info(
-            "reply by owner: replied_id=%s found_in_db=%s media_type=%s has_file_id=%s has_local=%s replied_user=%s",
+            "reply by owner: replied_id=%s found_in_db=%s media_type=%s has_file_id=%s has_local=%s sd=%s replied_user=%s",
             replied_id,
             bool(replied),
             replied_media_type,
             bool(replied_media_file_id),
             bool(replied_local_path),
+            replied_is_sd,
             replied_user_id,
         )
 
@@ -374,6 +449,11 @@ async def main() -> None:
             return
         if replied_user_id == owner_user_id:
             log.info("reply skip: replied message is from owner")
+            return
+        # Сообщение «без ограничений на просмотр» имеет смысл только для
+        # исчезающих/одноразовых медиа. Обычные сообщения владелец и так видит.
+        if not replied_is_sd:
+            log.info("reply skip: replied message is not self-destructing")
             return
 
         caption = (
@@ -387,17 +467,9 @@ async def main() -> None:
         # Если локальной копии ещё нет, но есть file_id — попробуем скачать
         # прямо сейчас (фоновое скачивание могло не успеть завершиться).
         if not replied_local_path and replied_media_file_id:
-            try:
-                await cache_media_file(
-                    bot, message.chat.id, replied_id, replied_media_type, replied_media_file_id
-                )
-                row2 = db.execute(
-                    "SELECT media_local_path FROM messages WHERE chat_id = ? AND message_id = ?",
-                    (message.chat.id, replied_id),
-                ).fetchone()
-                replied_local_path = row2[0] if row2 else None
-            except Exception as e:
-                log.warning("on-demand cache failed: %s", e)
+            replied_local_path = await cache_media_file(
+                bot, message.chat.id, replied_id, replied_media_type, replied_media_file_id
+            )
 
         try:
             await send_saved_media(
@@ -407,6 +479,7 @@ async def main() -> None:
                 replied_media_file_id,
                 caption,
                 local_path=replied_local_path,
+                is_self_destruct=replied_is_sd,
             )
             log.info("forwarded unrestricted media to owner_chat=%s", owner_chat)
         except Exception as e:
@@ -467,13 +540,13 @@ async def main() -> None:
 
         for msg_id in event.message_ids:
             row = db.execute(
-                "SELECT user_name, chat_title, text, media_type, media_file_id, media_local_path FROM messages "
+                "SELECT user_name, chat_title, text, media_type, media_file_id, media_local_path, is_self_destruct FROM messages "
                 "WHERE chat_id = ? AND message_id = ?",
                 (event.chat.id, msg_id),
             ).fetchone()
 
             if row:
-                user_name, chat_title, text, media_type, media_file_id, media_local_path = row
+                user_name, chat_title, text, media_type, media_file_id, media_local_path, is_sd = row
                 header = (
                     "🗑 <b>Сообщение удалено</b>\n"
                     f"Чат: {escape(chat_title)}\n"
@@ -487,6 +560,7 @@ async def main() -> None:
                         await send_saved_media(
                             bot, owner, media_type, media_file_id, caption,
                             local_path=media_local_path,
+                            is_self_destruct=bool(is_sd),
                         )
                     except Exception as e:
                         log.warning("send deleted media failed: %s", e)
